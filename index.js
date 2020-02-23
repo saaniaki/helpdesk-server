@@ -9,12 +9,40 @@ const uuidv4 = require('uuid/v4');
 const privateKey = fs.readFileSync('./keys/private.pem');
 const publicKey = fs.readFileSync('./keys/public.pem');
 const app = express();
+const mysql = require('mysql');
+const bcrypt = require('bcrypt');
+const saltRounds = 10;
 app.use(cors());
 app.use(bodyParser.json());
-const server = app.listen(4000, () => {
-    console.log('listening on port 4000');
+const server = app.listen(8081, () => {
+    console.log('listening on port 8081');
 }); // TODO must convert this to HTTPS or use specific container setup
 
+const connection = mysql.createConnection({
+    host: process.env.ENDPOINT || 'localhost',
+    user: process.env.DB_USER || 'saaniakihes',
+    password: process.env.PASSWORD || 'password',
+    database: 'helpdesk'
+});
+connection.connect();
+
+// app.post('/login/hash', (req, res, next) => {
+//     res.set('Content-Type', 'application/json');
+//     if (!isValidString(req.body.password)) {
+//         res.sendStatus(400);
+//         next(new Error('Bad Request'));
+//     } else {
+//         bcrypt.hash(req.body.password, saltRounds, function (err, hash) {
+//             res.end(JSON.stringify({
+//                 hash: hash
+//             }));
+//         });
+//     }
+// });
+
+app.get('/health', (req, res) => {
+    res.end('OK');
+});
 
 app.post('/login/client', (req, res, next) => {
     res.set('Content-Type', 'application/json');
@@ -41,18 +69,41 @@ app.post('/login/help-desk', (req, res, next) => {
     if (!isValidString(req.body.username) || !isValidString(req.body.password)) {
         res.sendStatus(400);
         next(new Error('Bad Request'));
-    } else
-        issueJWT(
-            req.body.username,
-            req.body.firstName,
-            req.body.lastName,
-            false,
-            (err, token) => {
-                res.end(JSON.stringify({
-                    token: token
-                }));
+    } else {
+        const query = "select hash, `first-name`, `last-name` from helpers where username = ?";
+        connection.query(query, [req.body.username], (error, results, fields) => {
+            if (error) {
+                res.sendStatus(500);
+                next(new Error('Database Error.'));
+            } else if (results[0] !== undefined) {
+                bcrypt.compare(req.body.password, results[0].hash, (err, result) => {
+                    if (result === true) {
+                        issueJWT(
+                            req.body.username,
+                            req.body.firstName,
+                            req.body.lastName,
+                            false,
+                            (err, token) => {
+                                res.end(JSON.stringify({
+                                    token: token
+                                }));
+                            }
+                        );
+                    } else {
+                        res.sendStatus(401);
+                        res.end({
+                            token: null
+                        });
+                    }
+                });
+            } else {
+                res.sendStatus(401);
+                res.end({
+                    token: null
+                });
             }
-        );
+        });
+    }
 });
 
 function isValidString(parameter) {
@@ -85,7 +136,7 @@ io.sockets.on('connection', socketioJwt.authorize({
     timeout: 500 // 15 seconds to send the authentication message
 })).on('authenticated', socket => {
     registerUser(socket);
-    
+
     const currentUserName = socket.decoded_token.username;
 
     socket.on('chatSend', msg => {
@@ -93,12 +144,16 @@ io.sockets.on('connection', socketioJwt.authorize({
 
         if (currentConvo !== undefined) {
             const data = {
-                timeStamp: new Date(),
+                timestamp: new Date(),
                 message: msg
             };
 
-            io.to(`${currentConvo.client.socketID}`).emit('chatReceive', { ...data, isMe: currentConvo.client.username == currentUserName });
-            io.to(`${currentConvo.helper.socketID}`).emit('chatReceive', { ...data, isMe: currentConvo.client.username != currentUserName });
+            var post = { from: currentConvo.client.username, to: currentConvo.helper.username, ...data };
+            var query = connection.query('INSERT INTO messages SET ?', post, function (error, results, fields) {
+                if (error) throw error;
+                io.to(`${currentConvo.client.socketID}`).emit('chatReceive', { ...data, isMe: currentConvo.client.username == currentUserName });
+                io.to(`${currentConvo.helper.socketID}`).emit('chatReceive', { ...data, isMe: currentConvo.client.username != currentUserName });
+            });
         }
     });
 
@@ -107,10 +162,10 @@ io.sockets.on('connection', socketioJwt.authorize({
         if (currentConvo !== undefined) {
             if (currentConvo.client.username != currentUserName) io.to(`${currentConvo.client.socketID}`).emit('partyLeft', null);
             else io.to(`${currentConvo.helper.socketID}`).emit('partyLeft', null);
-            conversationList = conversationList.filter( c => !c.containsUsername(currentUserName));
+            conversationList = conversationList.filter(c => !c.containsUsername(currentUserName));
         } else {
-            if (socket.decoded_token.isClient) clientQueue = clientQueue.filter( c => c.username !== currentUserName);
-            else helperQueue = clientQueue.filter( c => c.username !== currentUserName);
+            if (socket.decoded_token.isClient) clientQueue = clientQueue.filter(c => c.username !== currentUserName);
+            else helperQueue = clientQueue.filter(c => c.username !== currentUserName);
         }
     });
 
@@ -124,7 +179,7 @@ function registerUser(socket) {
     const currentUserName = socket.decoded_token.username;
     if (socket.decoded_token.isClient) {
         // console.log(`registering ${currentUserName} : ${socket.id} as client`);
-        let client = new Client(currentUserName, socket.id);
+        let client = new Client(currentUserName, socket.id, socket.decoded_token.firstName, socket.decoded_token.lastName, socket.decoded_token.isClient);
         if (helperQueue.length != 0) {
             let helper = helperQueue.shift();
             conversationList.push(new Conversation(client, helper));
@@ -134,7 +189,7 @@ function registerUser(socket) {
             clientQueue.push(client);
     } else {
         // console.log(`registering ${currentUserName} : ${socket.id} as helper`);
-        let helper = new Helper(currentUserName, socket.id);
+        let helper = new Helper(currentUserName, socket.id, socket.decoded_token.firstName, socket.decoded_token.lastName, socket.decoded_token.isClient);
         if (clientQueue.length != 0) {
             let client = clientQueue.shift();
             conversationList.push(new Conversation(client, helper));
@@ -155,22 +210,26 @@ function findConversation(currentUserName) {
 
 /* Models */
 
-class Client {
-
-    constructor(username, socketID) {
+class User {
+    constructor(username, socketID, firstName, lastName, isClient) {
         this.username = username;
         this.socketID = socketID;
+        this.firstName = firstName;
+        this.lastName = lastName;
+        this.isClient = isClient;
     }
-
 }
 
-class Helper {
-
-    constructor(username, socketID) {
-        this.username = username;
-        this.socketID = socketID;
+class Client extends User {
+    constructor(username, socketID, firstName, lastName, isClient) {
+        super(username, socketID, firstName, lastName, isClient);
     }
+}
 
+class Helper extends User {
+    constructor(username, socketID, firstName, lastName, isClient) {
+        super(username, socketID, firstName, lastName, isClient);
+    }
 }
 
 class Conversation {
